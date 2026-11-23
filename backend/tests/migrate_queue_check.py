@@ -283,6 +283,60 @@ def main():
         proc.terminate()
         proc.wait(timeout=10)
 
+    # 9) 并发探针服务：四夹具（双锁同改/假第二笔/锁行温层分叉/并发半截）流水可重放
+    from app.services import probe as probe_svc  # noqa: E402
+
+    with db() as conn:
+        pp = conn.execute(
+            "SELECT id FROM partitions WHERE status='在册' ORDER BY id LIMIT 1"
+        ).fetchone()["id"]
+    probe_out = probe_svc.run_probe(pp, workers=4)
+    check("探针: 四夹具全部闭合", probe_out["status"] == "闭合" and not probe_out["errors"],
+          probe_out.get("summary"))
+    check("探针: 同层拒单不留幽灵单",
+          all(c["ok"] for c in probe_out["checks"] if c["name"] == "同层拒单整笔不留幽灵单"))
+    probe_runs = client.get("/api/迁移/探针流水").json()
+    latest = probe_runs[0]
+    check("探针: 流水落库且含核验事件",
+          latest["status"] == "闭合" and len(latest["events"]) >= len(probe_out["checks"]),
+          f"events={len(latest['events'])}")
+    check("探针: 流水只记真实回执，无 surface 旁路字段",
+          all("claim_ok" not in e["detail"] and "surface" not in e["detail"] for e in latest["events"]))
+
+    # 10) 锁行列表/等候读模型/详情拒因页/总览徽章 同库重放
+    with db() as conn:
+        prow = conn.execute("SELECT tier FROM partitions WHERE id=?", (pp,)).fetchone()
+        open_tier = next(t for t in ("热档", "温档", "冷档") if t != prow["tier"])
+        wait_tier = next(t for t in ("热档", "温档", "冷档") if t not in (prow["tier"], open_tier))
+    s1 = svc.start_migrate(pp, open_tier)
+    s2 = svc.start_migrate(pp, wait_tier)
+    locks = client.get("/api/迁移/锁行").json()
+    waits = client.get("/api/迁移/等候").json()
+    check("读模型: 锁行列表同分区至多一行且温层锁死",
+          len(locks) == 1 and locks[0]["job_id"] == s1["job_id"] and locks[0]["tier_frozen"] == 1,
+          str(locks))
+    check("读模型: 等候投影队次与前方锁行可重放",
+          len(waits) == 1 and waits[0]["job_id"] == s2["job_id"]
+          and waits[0]["queue_pos"] == 1 and waits[0]["hold_job_id"] == s1["job_id"],
+          str(waits))
+    d_lock = client.get(f"/api/迁移/{s1['job_id']}").json()
+    d_wait = client.get(f"/api/迁移/{s2['job_id']}").json()
+    check("详情页: 占坑单带锁死标记，等候单带队次与前方占坑",
+          d_lock["tier_frozen"] == 1 and d_wait["queue_pos"] == 1
+          and d_wait["hold"]["hold_job_id"] == s1["job_id"])
+    dash2 = client.get("/api/总览").json()
+    check("总览: 占坑徽章由锁行重放且锁死数恒等",
+          dash2["迁移占坑中"] == 1 and dash2["占坑温层锁死"] == 1
+          and "surface_ok" not in dash2 and "claim_ok" not in dash2, str(dash2))
+    # 清场
+    f = svc.finish_migrate(s1["job_id"], True)
+    last_id = f["promoted"]["job_id"] if f["promoted"] else None
+    if last_id:
+        svc.finish_migrate(last_id, True)
+    dash3 = client.get("/api/总览").json()
+    check("总览: 清场后占坑/锁死/等候徽章归零",
+          dash3["迁移占坑中"] == 0 and dash3["占坑温层锁死"] == 0 and dash3["迁移等候中"] == 0)
+
     print()
     if FAILED:
         print(f"未闭合 {len(FAILED)} 项: {FAILED}")

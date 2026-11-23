@@ -148,6 +148,20 @@ th { color: var(--amber); font-weight: 600; }
   white-space: nowrap;
 }
 .badge.wait { color: var(--muted); border-color: #4a3038; }
+.badge.danger-badge { color: var(--danger); border-color: var(--danger); }
+.row-link { cursor: pointer; }
+.row-link:hover td { background: rgba(239, 197, 106, .08); }
+.sub-table { margin: 8px 0; font-size: .85rem; }
+.sub-table th, .sub-table td { padding: 6px 8px; }
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .62);
+  display: flex; align-items: center; justify-content: center; z-index: 20;
+}
+.modal {
+  background: #1a1014; border: 1px solid #6a4050; padding: 22px;
+  width: min(640px, 92vw); max-height: 86vh; overflow: auto;
+}
+.modal h2 { margin-top: 0; }
 h2 { font-size: 1.15rem; color: var(--paper); margin: 8px 0 12px; }
 @media (max-width: 720px) {
   .main { padding: 18px 14px 120px; }

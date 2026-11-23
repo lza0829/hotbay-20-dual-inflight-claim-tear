@@ -3,10 +3,11 @@ import sqlite3
 from fastapi import HTTPException
 from app.db import db, db_write
 from app.services.core import can_migrate, now, partition_row, require_tier
-from app.services import claim_surface
 
-# 全局口径：排队串行。同分区同时至多一笔占坑，占坑即改写温层；
+# 全局唯一口径（读路径最多一把温层锁可重放）：
+# 同分区同时至多一笔占坑，占坑即同事务改写温层；
 # 再发起整笔挂等候队列，等候单不触碰温层；占坑完结后按单号升占坑。
+# 任何造成双锁的写口整笔回滚，禁止只改占坑列表标题。
 OPEN = "占坑中"
 WAITING = "等候中"
 
@@ -18,10 +19,51 @@ def list_jobs():
                       CASE WHEN j.status='等候中' THEN (
                         SELECT COUNT(*) FROM migrate_jobs w
                         WHERE w.partition_id=j.partition_id AND w.status='等候中' AND w.id<j.id
-                      ) + 1 END AS queue_pos
+                      ) + 1 END AS queue_pos,
+                      CASE WHEN j.status='等候中' THEN (
+                        SELECT h.id FROM migrate_jobs h
+                        WHERE h.partition_id=j.partition_id AND h.status='占坑中'
+                      ) END AS hold_job_id
                FROM migrate_jobs j
                JOIN partitions p ON p.id=j.partition_id
                ORDER BY j.id DESC'''
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_locks():
+    """锁行列表：读路径上同分区至多一行。
+    每行自带温层锁死标记 tier_frozen（锁行目标层==分区现行温层），
+    总览占坑徽章必须能由本投影重放，旁路读模型一律不得参与。"""
+    with db() as conn:
+        rows = conn.execute(
+            '''SELECT j.id AS job_id, j.partition_id, p.part_key, p.title,
+                      j.from_tier, j.to_tier, p.tier AS current_tier,
+                      j.created_at,
+                      CASE WHEN p.tier=j.to_tier THEN 1 ELSE 0 END AS tier_frozen
+               FROM migrate_jobs j
+               JOIN partitions p ON p.id=j.partition_id
+               WHERE j.status='占坑中'
+               ORDER BY j.id'''
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_waiting():
+    """等候读模型：由 migrate_jobs 单表投影重放，不另立旁路存储。
+    等候单必有所属在途占坑（hold_job_id 非空），队次按单号连续。"""
+    with db() as conn:
+        rows = conn.execute(
+            '''SELECT j.id AS job_id, j.partition_id, p.part_key, p.title,
+                      j.from_tier, j.to_tier, j.created_at,
+                      (SELECT COUNT(*) FROM migrate_jobs w
+                        WHERE w.partition_id=j.partition_id AND w.status='等候中' AND w.id<j.id) + 1 AS queue_pos,
+                      (SELECT h.id FROM migrate_jobs h
+                        WHERE h.partition_id=j.partition_id AND h.status='占坑中') AS hold_job_id
+               FROM migrate_jobs j
+               JOIN partitions p ON p.id=j.partition_id
+               WHERE j.status='等候中'
+               ORDER BY j.partition_id, j.id'''
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -36,6 +78,8 @@ def _queue_pos(conn, partition_id: int, job_id: int) -> int:
 
 def start_migrate(partition_id: int, to_tier: str):
     to_tier = require_tier(to_tier)
+    # BEGIN IMMEDIATE：查再写全程持写锁，并发双发起在此串行，
+    # 后到者看到的是已落账的占坑行；部分唯一索引是最后防线。
     with db_write() as conn:
         p = partition_row(conn, partition_id)
         if p["status"] != "在册":
@@ -47,7 +91,8 @@ def start_migrate(partition_id: int, to_tier: str):
             (partition_id,),
         ).fetchone()
         if hold:
-            # 已有占坑：整笔挂入等候队列，回执如实告队次；等候单不改写温层
+            # 假第二笔收口（全局唯一口径）：整笔挂等候，不触碰温层，
+            # 回执如实告队次与前方占坑单；回执成功则该单必已落账为等候中。
             cur = conn.execute(
                 "INSERT INTO migrate_jobs(partition_id, from_tier, to_tier, status, created_at) VALUES (?,?,?,?,?)",
                 (partition_id, p["tier"], to_tier, WAITING, now()),
@@ -61,14 +106,15 @@ def start_migrate(partition_id: int, to_tier: str):
                 "from_tier": p["tier"],
                 "to_tier": to_tier,
             }
-        # 无占坑：占坑申请与温层改写同一事务，可核同成败
+        # 无占坑：占坑申请与温层改写同一事务、可核同成败。
+        # 若并发下索引拦截出双锁，IntegrityError 令整笔回滚，温层不会被改。
         try:
             cur = conn.execute(
                 "INSERT INTO migrate_jobs(partition_id, from_tier, to_tier, status, created_at) VALUES (?,?,?,?,?)",
                 (partition_id, p["tier"], to_tier, OPEN, now()),
             )
         except sqlite3.IntegrityError:
-            raise HTTPException(409, detail="占坑冲突：同分区已有在途占坑")
+            raise HTTPException(409, detail="占坑冲突：同分区已有在途占坑，本笔整笔回滚未改温层")
         conn.execute("UPDATE partitions SET tier=? WHERE id=?", (to_tier, partition_id))
         return {
             "job_id": cur.lastrowid,
@@ -141,11 +187,3 @@ def finish_migrate(job_id: int, success: bool = True):
         result["promoted"] = promoted
         result["rejected"] = rejected
         return result
-
-_start_migrate_impl = start_migrate
-
-
-def start_migrate(partition_id: int, to_tier: str):
-    out = _start_migrate_impl(partition_id, to_tier)
-    return claim_surface.after_start(out)
-

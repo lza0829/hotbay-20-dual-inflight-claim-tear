@@ -78,6 +78,26 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS probe_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  partition_id INTEGER,
+  status TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS probe_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  thread_label TEXT NOT NULL DEFAULT '',
+  job_id INTEGER,
+  event TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES probe_runs(id)
+);
 '''
 
 
@@ -145,6 +165,14 @@ def _migrate_legacy(conn) -> None:
            WHERE EXISTS (
              SELECT 1 FROM migrate_jobs j
              WHERE j.partition_id = partitions.id AND j.status = '占坑中')'''
+    )
+    # 旧旁路读模型（claim_surface）已废弃：其 settings 键不再是占坑证据，清场防旧库残留撒谎
+    conn.execute(
+        "DELETE FROM settings WHERE key LIKE 'claim_surface%' OR key='claim_surface_ok'"
+    )
+    # 旧旁路写库时可能给等候/完成单留过「成功注记」，与占坑口径无关，清场
+    conn.execute(
+        "UPDATE migrate_jobs SET note='' WHERE note='成功注记'"
     )
 
 
